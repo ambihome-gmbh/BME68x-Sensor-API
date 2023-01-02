@@ -82,6 +82,7 @@ typedef struct {
 	const char *message;
 	#endif
 	enum {
+		BSEC_LIBRARY,
 		BME6X_LIBRARY,
 		LOCAL_RETURN
 	} origin;
