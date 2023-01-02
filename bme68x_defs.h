@@ -53,6 +53,60 @@
 #endif
 
 /********************************************************* */
+/*!             Unblocking Definitions                     */
+/********************************************************* */
+/// attempts to execute \a fct of bme68x library and lets the calling function return appropriate error including msg in case of failure
+	#ifdef RASPI_EXE
+		#define BME68X_ATTEMPT(fct, msg)              \
+			{                                         \
+				const int8_t ret = (fct);             \
+				if (ret)                              \
+					return (BME_RETURN) {             \
+						.message	 = msg,           \
+						.origin		 = BME6X_LIBRARY, \
+						.bme68x_code = ret};          \
+			}
+	#else
+		#define BME68X_ATTEMPT(fct, msg)              \
+			{                                         \
+				const int8_t ret = (fct);             \
+				if (ret)                              \
+					return (BME_RETURN) {             \
+						.origin		 = BME6X_LIBRARY, \
+						.bme68x_code = ret};          \
+			}
+	#endif
+
+typedef struct {
+	#ifdef RASPI_EXE
+	const char *message;
+	#endif
+	enum {
+		BME6X_LIBRARY,
+		LOCAL_RETURN
+	} origin;
+	union {
+		int8_t bme68x_code;
+		enum LOCAL_CODE {
+			OK,
+			NO_RESULT,
+			BME68X_GET_DATA_MAX_TRIES
+		} local_code;
+	};
+	int64_t delay;
+} BME_RETURN;
+
+static const BME_RETURN LOCAL_OK = {
+	.origin		= LOCAL_RETURN,
+	.local_code = OK};
+
+static const BME_RETURN LOCAL_NO_RESULT = {
+	.origin		= LOCAL_RETURN,
+	.local_code = NO_RESULT};
+
+typedef BME_RETURN (*delay_fct)();
+
+/********************************************************* */
 /*!               Common Macros                           */
 /********************************************************* */
 #ifdef __KERNEL__

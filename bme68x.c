@@ -39,6 +39,8 @@
 #include "bme68x.h"
 #include <stdio.h>
 
+static struct bme68x_dev *Dev;	  ///< buffer for device pointer
+
 /* This internal API is used to read the calibration coefficients */
 static int8_t get_calib_data(struct bme68x_dev *dev);
 
@@ -91,7 +93,7 @@ static uint8_t calc_res_heat(uint16_t temp, const struct bme68x_dev *dev);
 #endif
 
 /* This internal API is used to read a single data of the sensor */
-static int8_t read_field_data(uint8_t index, struct bme68x_data *data, struct bme68x_dev *dev);
+static BME_RETURN read_field_data(uint8_t index, struct bme68x_data *data, struct bme68x_dev *dev, delay_fct *next);
 
 /* This internal API is used to read all data fields of the sensor */
 static int8_t read_all_field_data(struct bme68x_data * const data[], struct bme68x_dev *dev);
@@ -137,256 +139,238 @@ static int8_t analyze_sensor_data(const struct bme68x_data *data, uint8_t n_meas
 /*                                 Global API definitions                                 */
 /******************************************************************************************/
 
+static BME_RETURN bme68x_return(uint8_t code, const char *msg) {
+	return (BME_RETURN) {
+#ifdef RASPI_EXE
+		.message = msg,
+#endif
+		.origin		 = BME6X_LIBRARY,
+		.bme68x_code = (code)};
+}
+
 /* @brief This API reads the chip-id of the sensor which is the first step to
 * verify the sensor and also calibrates the sensor
 * As this API is the entry point, call this API before using other APIs.
 */
-int8_t bme68x_init(struct bme68x_dev *dev)
-{
-    int8_t rslt;
+static delay_fct *init_next;
+#ifdef BME_SPI_INTERFACE
+static delay_fct init_next_internal;
+#endif
 
-    rslt = bme68x_soft_reset(dev);
-    if (rslt == BME68X_OK)
-    {
-        rslt = bme68x_get_regs(BME68X_REG_CHIP_ID, &dev->chip_id, 1, dev);
-        if (rslt == BME68X_OK)
-        {
-            if (dev->chip_id == BME68X_CHIP_ID)
-            {
-                /* Read Variant ID */
-                rslt = read_variant_id(dev);
+static BME_RETURN init_continue() {
+#ifdef BME_SPI_INTERFACE
+	if (init_next_internal != NULL) {
+		return init_next_internal();
+	}
+#endif
 
-                if (rslt == BME68X_OK)
-                {
-                    /* Get the Calibration data */
-                    rslt = get_calib_data(dev);
-                }
-            }
-            else
-            {
-                rslt = BME68X_E_DEV_NOT_FOUND;
-            }
-        }
-    }
+	*init_next = NULL;
 
-    return rslt;
+	BME68X_ATTEMPT(bme68x_get_regs(BME68X_REG_CHIP_ID, &Dev->chip_id, 1, Dev), "failed to get chip id");
+	if (Dev->chip_id == BME68X_CHIP_ID) {
+		/* Read Variant ID */
+		BME68X_ATTEMPT(read_variant_id(Dev), "failed to read variant id");
+		/* Get the Calibration data */
+		BME68X_ATTEMPT(get_calib_data(Dev), "failed to get calib data");
+
+		return LOCAL_NO_RESULT;
+	}
+	return bme68x_return(BME68X_E_DEV_NOT_FOUND, "invalid chip id");
+}
+
+BME_RETURN bme68x_init(struct bme68x_dev *dev, delay_fct *next) {
+	Dev		  = dev;
+	init_next = next;
+	*next	  = init_continue;
+
+#ifdef BME_SPI_INTERFACE
+	return bme68x_soft_reset(dev, init_next_internal);
+#else
+	return bme68x_soft_reset(dev, NULL);
+#endif
 }
 
 /*
  * @brief This API writes the given data to the register address of the sensor
  */
-int8_t bme68x_set_regs(const uint8_t *reg_addr, const uint8_t *reg_data, uint32_t len, struct bme68x_dev *dev)
-{
-    int8_t rslt;
+int8_t bme68x_set_regs(const uint8_t *reg_addr, const uint8_t *reg_data, uint32_t len, struct bme68x_dev *dev) {
+	int8_t rslt;
 
-    /* Length of the temporary buffer is 2*(length of register)*/
-    uint8_t tmp_buff[BME68X_LEN_INTERLEAVE_BUFF] = { 0 };
-    uint16_t index;
+	/* Length of the temporary buffer is 2*(length of register)*/
+	uint8_t	 tmp_buff[BME68X_LEN_INTERLEAVE_BUFF] = {0};
+	uint16_t index;
 
-    /* Check for null pointer in the device structure*/
-    rslt = null_ptr_check(dev);
-    if ((rslt == BME68X_OK) && reg_addr && reg_data)
-    {
-        if ((len > 0) && (len <= (BME68X_LEN_INTERLEAVE_BUFF / 2)))
-        {
-            /* Interleave the 2 arrays */
-            for (index = 0; index < len; index++)
-            {
-                if (dev->intf == BME68X_SPI_INTF)
-                {
-                    /* Set the memory page */
-                    rslt = set_mem_page(reg_addr[index], dev);
-                    tmp_buff[(2 * index)] = reg_addr[index] & BME68X_SPI_WR_MSK;
-                }
-                else
-                {
-                    tmp_buff[(2 * index)] = reg_addr[index];
-                }
+	/* Check for null pointer in the device structure*/
+	rslt = null_ptr_check(dev);
+	if ((rslt == BME68X_OK) && reg_addr && reg_data) {
+		if ((len > 0) && (len <= (BME68X_LEN_INTERLEAVE_BUFF / 2))) {
+			/* Interleave the 2 arrays */
+			for (index = 0; index < len; index++) {
+#ifdef BME_SPI_INTERFACE
+				/* Set the memory page */
+				rslt				  = set_mem_page(reg_addr[index], dev);
+				tmp_buff[(2 * index)] = reg_addr[index] & BME68X_SPI_WR_MSK;
+#else
+				tmp_buff[(2 * index)] = reg_addr[index];
+#endif
 
-                tmp_buff[(2 * index) + 1] = reg_data[index];
-            }
+				tmp_buff[(2 * index) + 1] = reg_data[index];
+			}
 
-            /* Write the interleaved array */
-            if (rslt == BME68X_OK)
-            {
-                dev->intf_rslt = dev->write(tmp_buff[0], &tmp_buff[1], (2 * len) - 1, dev->intf_ptr);
-                if (dev->intf_rslt != 0)
-                {
-                    rslt = BME68X_E_COM_FAIL;
-                }
-            }
-        }
-        else
-        {
-            rslt = BME68X_E_INVALID_LENGTH;
-        }
-    }
-    else
-    {
-        rslt = BME68X_E_NULL_PTR;
-    }
+			/* Write the interleaved array */
+			if (rslt == BME68X_OK) {
+				dev->intf_rslt = dev->write(tmp_buff[0], &tmp_buff[1], (2 * len) - 1, dev->intf_ptr);
+				if (dev->intf_rslt != 0) {
+					rslt = BME68X_E_COM_FAIL;
+				}
+			}
+		} else {
+			rslt = BME68X_E_INVALID_LENGTH;
+		}
+	} else {
+		rslt = BME68X_E_NULL_PTR;
+	}
 
-    return rslt;
+	return rslt;
 }
 
 /*
  * @brief This API reads the data from the given register address of sensor.
  */
-int8_t bme68x_get_regs(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, struct bme68x_dev *dev)
-{
-    int8_t rslt;
+int8_t bme68x_get_regs(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, struct bme68x_dev *dev) {
+	int8_t rslt;
 
-    /* Check for null pointer in the device structure*/
-    rslt = null_ptr_check(dev);
-    if ((rslt == BME68X_OK) && reg_data)
-    {
-        if (dev->intf == BME68X_SPI_INTF)
-        {
-            /* Set the memory page */
-            rslt = set_mem_page(reg_addr, dev);
-            if (rslt == BME68X_OK)
-            {
-                reg_addr = reg_addr | BME68X_SPI_RD_MSK;
-            }
-        }
+	/* Check for null pointer in the device structure*/
+	rslt = null_ptr_check(dev);
+	if ((rslt == BME68X_OK) && reg_data) {
+#ifdef BME_SPI_INTERFACE
+		/* Set the memory page */
+		rslt = set_mem_page(reg_addr, dev);
+		if (rslt == BME68X_OK) {
+			reg_addr = reg_addr | BME68X_SPI_RD_MSK;
+		}
+#endif
 
-        dev->intf_rslt = dev->read(reg_addr, reg_data, len, dev->intf_ptr);
-        if (dev->intf_rslt != 0)
-        {
-            rslt = BME68X_E_COM_FAIL;
-        }
-    }
-    else
-    {
-        rslt = BME68X_E_NULL_PTR;
-    }
+		dev->intf_rslt = dev->read(reg_addr, reg_data, len, dev->intf_ptr);
+		if (dev->intf_rslt != 0) {
+			rslt = BME68X_E_COM_FAIL;
+		}
+	} else {
+		rslt = BME68X_E_NULL_PTR;
+	}
 
-    return rslt;
+	return rslt;
 }
 
 /*
  * @brief This API soft-resets the sensor.
  */
-int8_t bme68x_soft_reset(struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t reg_addr = BME68X_REG_SOFT_RESET;
+#ifdef BME_SPI_INTERFACE
+static delay_fct *Soft_reset_next;
 
-    /* 0xb6 is the soft reset command */
-    uint8_t soft_rst_cmd = BME68X_SOFT_RESET_CMD;
-
-    /* Check for null pointer in the device structure*/
-    rslt = null_ptr_check(dev);
-    if (rslt == BME68X_OK)
-    {
-        if (dev->intf == BME68X_SPI_INTF)
-        {
-            rslt = get_mem_page(dev);
-        }
-
-        /* Reset the device */
-        if (rslt == BME68X_OK)
-        {
-            rslt = bme68x_set_regs(&reg_addr, &soft_rst_cmd, 1, dev);
-
-            /* Wait for 5ms */
-            dev->delay_us(BME68X_PERIOD_RESET, dev->intf_ptr);
-            if (rslt == BME68X_OK)
-            {
-                /* After reset get the memory page */
-                if (dev->intf == BME68X_SPI_INTF)
-                {
-                    rslt = get_mem_page(dev);
-                }
-            }
-        }
-    }
-
-    return rslt;
+static BME_RETURN soft_reset_finish() {
+	/* After reset get the memory page */
+	BME68X_ATTEMPT(get_mem_page(Dev), "failed to get mem_page after soft reset");
+	*Soft_reset_next = NULL;
+	return LOCAL_NO_RESULT;
 }
+#endif
+
+BME_RETURN bme68x_soft_reset(struct bme68x_dev *dev, delay_fct *next) {
+	int8_t	rslt;
+	uint8_t reg_addr = BME68X_REG_SOFT_RESET;
+
+	/* 0xb6 is the soft reset command */
+	uint8_t soft_rst_cmd = BME68X_SOFT_RESET_CMD;
+
+	/* Check for null pointer in the device structure*/
+	BME68X_ATTEMPT(null_ptr_check(dev), "found NULL in device (soft_reset)")
+
+#ifdef BME_SPI_INTERFACE
+	BME68X_ATTEMPT(get_mem_page(dev), "failed to get mem_page (soft_reset)");
+#endif
+
+	/* Reset the device */
+	BME68X_ATTEMPT(bme68x_set_regs(&reg_addr, &soft_rst_cmd, 1, dev), "failed to set soft reset");
+
+#ifdef BME_SPI_INTERFACE
+	Dev				= dev;
+	Soft_reset_next = next;
+	*next			= soft_reset_finish;
+#endif
+
+	/* Wait for 5ms */
+	return (BME_RETURN) {
+		.origin		= LOCAL_RETURN,
+		.delay		= BME68X_PERIOD_RESET,
+		.local_code = NO_RESULT};
+}
+
+static struct bme68x_conf *Conf;
+static delay_fct		   Set_conf_next_intern;
+static uint8_t			   Current_op_mode;
+static delay_fct *		   Set_conf_next;
+
+static BME_RETURN set_conf_continue() {
+	if (Set_conf_next_intern != NULL) {
+		return Set_conf_next_intern();
+	}
+
+	uint8_t odr20 = 0, odr3 = 1;
+
+	/* Register data starting from BME68X_REG_CTRL_GAS_1(0x71) up to BME68X_REG_CONFIG(0x75) */
+	uint8_t reg_array[BME68X_LEN_CONFIG]  = {0x71, 0x72, 0x73, 0x74, 0x75};
+	uint8_t data_array[BME68X_LEN_CONFIG] = {0};
+
+	if (Conf == NULL) {
+		return bme68x_return(BME68X_E_NULL_PTR, "Null Conf passed to set_conf");
+	}
+	/* Read the whole configuration and write it back once later */
+	BME68X_ATTEMPT(bme68x_get_regs(reg_array[0], data_array, BME68X_LEN_CONFIG, Dev), "failed to read conf");
+
+	Dev->info_msg = BME68X_OK;
+	BME68X_ATTEMPT(boundary_check(&Conf->filter, BME68X_FILTER_SIZE_127, Dev), "filter invalid");
+	BME68X_ATTEMPT(boundary_check(&Conf->os_temp, BME68X_OS_16X, Dev), "os_temp invalid");
+	BME68X_ATTEMPT(boundary_check(&Conf->os_pres, BME68X_OS_16X, Dev), "os_pres invalid");
+	BME68X_ATTEMPT(boundary_check(&Conf->os_hum, BME68X_OS_16X, Dev), "os_hum invalid");
+	BME68X_ATTEMPT(boundary_check(&Conf->odr, BME68X_ODR_NONE, Dev), "odr invalid");
+	data_array[4] = BME68X_SET_BITS(data_array[4], BME68X_FILTER, Conf->filter);
+	data_array[3] = BME68X_SET_BITS(data_array[3], BME68X_OST, Conf->os_temp);
+	data_array[3] = BME68X_SET_BITS(data_array[3], BME68X_OSP, Conf->os_pres);
+	data_array[1] = BME68X_SET_BITS_POS_0(data_array[1], BME68X_OSH, Conf->os_hum);
+	if (Conf->odr != BME68X_ODR_NONE) {
+		odr20 = Conf->odr;
+		odr3  = 0;
+	}
+
+	data_array[4] = BME68X_SET_BITS(data_array[4], BME68X_ODR20, odr20);
+	data_array[0] = BME68X_SET_BITS(data_array[0], BME68X_ODR3, odr3);
+
+	BME68X_ATTEMPT(bme68x_set_regs(reg_array, data_array, BME68X_LEN_CONFIG, Dev), "failed to set config registers");
+
+	if (Current_op_mode != BME68X_SLEEP_MODE) {
+		return bme68x_set_op_mode(Current_op_mode, Dev, Set_conf_next);
+	}
+
+	*Set_conf_next = NULL;
+
+	return LOCAL_NO_RESULT;
+}
+
 
 /*
  * @brief This API is used to set the oversampling, filter and odr configuration
  */
-int8_t bme68x_set_conf(struct bme68x_conf *conf, struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t odr20 = 0, odr3 = 1;
-    uint8_t current_op_mode;
+BME_RETURN bme68x_set_conf(struct bme68x_conf *conf, struct bme68x_dev *dev, delay_fct *next) {
+	Dev			  = dev;
+	Set_conf_next = next;
+	Conf		  = conf;
 
-    /* Register data starting from BME68X_REG_CTRL_GAS_1(0x71) up to BME68X_REG_CONFIG(0x75) */
-    uint8_t reg_array[BME68X_LEN_CONFIG] = { 0x71, 0x72, 0x73, 0x74, 0x75 };
-    uint8_t data_array[BME68X_LEN_CONFIG] = { 0 };
+	*next = set_conf_continue;
 
-    rslt = bme68x_get_op_mode(&current_op_mode, dev);
-    if (rslt == BME68X_OK)
-    {
-        /* Configure only in the sleep mode */
-        rslt = bme68x_set_op_mode(BME68X_SLEEP_MODE, dev);
-    }
-
-    if (conf == NULL)
-    {
-        rslt = BME68X_E_NULL_PTR;
-    }
-    else if (rslt == BME68X_OK)
-    {
-        /* Read the whole configuration and write it back once later */
-        rslt = bme68x_get_regs(reg_array[0], data_array, BME68X_LEN_CONFIG, dev);
-        dev->info_msg = BME68X_OK;
-        if (rslt == BME68X_OK)
-        {
-            rslt = boundary_check(&conf->filter, BME68X_FILTER_SIZE_127, dev);
-        }
-
-        if (rslt == BME68X_OK)
-        {
-            rslt = boundary_check(&conf->os_temp, BME68X_OS_16X, dev);
-        }
-
-        if (rslt == BME68X_OK)
-        {
-            rslt = boundary_check(&conf->os_pres, BME68X_OS_16X, dev);
-        }
-
-        if (rslt == BME68X_OK)
-        {
-            rslt = boundary_check(&conf->os_hum, BME68X_OS_16X, dev);
-        }
-
-        if (rslt == BME68X_OK)
-        {
-            rslt = boundary_check(&conf->odr, BME68X_ODR_NONE, dev);
-        }
-
-        if (rslt == BME68X_OK)
-        {
-            data_array[4] = BME68X_SET_BITS(data_array[4], BME68X_FILTER, conf->filter);
-            data_array[3] = BME68X_SET_BITS(data_array[3], BME68X_OST, conf->os_temp);
-            data_array[3] = BME68X_SET_BITS(data_array[3], BME68X_OSP, conf->os_pres);
-            data_array[1] = BME68X_SET_BITS_POS_0(data_array[1], BME68X_OSH, conf->os_hum);
-            if (conf->odr != BME68X_ODR_NONE)
-            {
-                odr20 = conf->odr;
-                odr3 = 0;
-            }
-
-            data_array[4] = BME68X_SET_BITS(data_array[4], BME68X_ODR20, odr20);
-            data_array[0] = BME68X_SET_BITS(data_array[0], BME68X_ODR3, odr3);
-        }
-    }
-
-    if (rslt == BME68X_OK)
-    {
-        rslt = bme68x_set_regs(reg_array, data_array, BME68X_LEN_CONFIG, dev);
-    }
-
-    if ((current_op_mode != BME68X_SLEEP_MODE) && (rslt == BME68X_OK))
-    {
-        rslt = bme68x_set_op_mode(current_op_mode, dev);
-    }
-
-    return rslt;
+	BME68X_ATTEMPT(bme68x_get_op_mode(&Current_op_mode, dev), "failed to get current op mode to set conf");
+	/* Configure only in the sleep mode */
+	return bme68x_set_op_mode(BME68X_SLEEP_MODE, dev, &Set_conf_next_intern);
 }
 
 /*
@@ -424,64 +408,69 @@ int8_t bme68x_get_conf(struct bme68x_conf *conf, struct bme68x_dev *dev)
     return rslt;
 }
 
+static uint8_t	  Op_mode;	  ///< buffer for operation mode
+static delay_fct *Set_op_next;
+
+static BME_RETURN check_sleep() {
+	const uint8_t reg_addr = BME68X_REG_CTRL_MEAS;
+	uint8_t		  tmp_pow_mode;
+
+	BME68X_ATTEMPT(bme68x_get_regs(BME68X_REG_CTRL_MEAS, &tmp_pow_mode, 1, Dev), "failed to get current mode");
+
+	/* Put to sleep before changing mode */
+	uint8_t pow_mode = (tmp_pow_mode & BME68X_MODE_MSK);
+	if (pow_mode != BME68X_SLEEP_MODE) {
+		tmp_pow_mode &= ~BME68X_MODE_MSK; /* Set to sleep */
+		BME68X_ATTEMPT(bme68x_set_regs(&reg_addr, &tmp_pow_mode, 1, Dev), "failed to set sleep mode");
+
+		return (BME_RETURN) {
+			.origin		= LOCAL_RETURN,
+			.local_code = NO_RESULT,
+			.delay		= BME68X_PERIOD_POLL};
+	}
+
+	/* Already in sleep */
+	if (Op_mode != BME68X_SLEEP_MODE) {
+		tmp_pow_mode = (tmp_pow_mode & ~BME68X_MODE_MSK) | (Op_mode & BME68X_MODE_MSK);
+		BME68X_ATTEMPT(bme68x_set_regs(&reg_addr, &tmp_pow_mode, 1, Dev), "failed to set operation mode registers");
+	}
+
+	*Set_op_next = NULL;
+
+	return LOCAL_NO_RESULT;
+}
+
+
 /*
  * @brief This API is used to set the operation mode of the sensor
  */
-int8_t bme68x_set_op_mode(const uint8_t op_mode, struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t tmp_pow_mode;
-    uint8_t pow_mode = 0;
-    uint8_t reg_addr = BME68X_REG_CTRL_MEAS;
+BME_RETURN bme68x_set_op_mode(const uint8_t op_mode, struct bme68x_dev *dev, delay_fct *next) {
+	Dev			= dev;
+	Set_op_next = next;
+	Op_mode		= op_mode;
 
-    /* Call until in sleep */
-    do
-    {
-        rslt = bme68x_get_regs(BME68X_REG_CTRL_MEAS, &tmp_pow_mode, 1, dev);
-        if (rslt == BME68X_OK)
-        {
-            /* Put to sleep before changing mode */
-            pow_mode = (tmp_pow_mode & BME68X_MODE_MSK);
-            if (pow_mode != BME68X_SLEEP_MODE)
-            {
-                tmp_pow_mode &= ~BME68X_MODE_MSK; /* Set to sleep */
-                rslt = bme68x_set_regs(&reg_addr, &tmp_pow_mode, 1, dev);
-                dev->delay_us(BME68X_PERIOD_POLL, dev->intf_ptr);
-            }
-        }
-    } while ((pow_mode != BME68X_SLEEP_MODE) && (rslt == BME68X_OK));
+	*Set_op_next = check_sleep;
 
-    /* Already in sleep */
-    if ((op_mode != BME68X_SLEEP_MODE) && (rslt == BME68X_OK))
-    {
-        tmp_pow_mode = (tmp_pow_mode & ~BME68X_MODE_MSK) | (op_mode & BME68X_MODE_MSK);
-        rslt = bme68x_set_regs(&reg_addr, &tmp_pow_mode, 1, dev);
-    }
-
-    return rslt;
+	return check_sleep();
 }
 
 /*
  * @brief This API is used to get the operation mode of the sensor.
  */
-int8_t bme68x_get_op_mode(uint8_t *op_mode, struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t mode;
+int8_t bme68x_get_op_mode(uint8_t *op_mode, struct bme68x_dev *dev) {
+	int8_t	rslt;
+	uint8_t mode;
 
-    if (op_mode)
-    {
-        rslt = bme68x_get_regs(BME68X_REG_CTRL_MEAS, &mode, 1, dev);
+	if (op_mode) {
+		rslt = bme68x_get_regs(BME68X_REG_CTRL_MEAS, &mode, 1, dev);
 
-        /* Masking the other register bit info*/
-        *op_mode = mode & BME68X_MODE_MSK;
-    }
-    else
-    {
-        rslt = BME68X_E_NULL_PTR;
-    }
+		/* Masking the other register bit info*/
+		*op_mode = mode & BME68X_MODE_MSK;
+	} else {
+		rslt = BME68X_E_NULL_PTR;
+	}
 
-    return rslt;
+	return rslt;
 }
 
 /*
@@ -537,148 +526,140 @@ uint32_t bme68x_get_meas_dur(const uint8_t op_mode, struct bme68x_conf *conf, st
  * from the sensor, compensates the data and store it in the bme68x_data
  * structure instance passed by the user.
  */
-int8_t bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n_data, struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t i = 0, j = 0, new_fields = 0;
-    struct bme68x_data *field_ptr[3] = { 0 };
-    struct bme68x_data field_data[3] = { { 0 } };
+#if !defined(BME_PARALLEL_MODE) && !defined(BME_SEQUENTIAL_MODE)
+static delay_fct		   Get_data_next_intern, *Get_data_next;
+static struct bme68x_data *Get_data_data;
+static uint8_t *		   Get_data_n_data;
 
-    field_ptr[0] = &field_data[0];
-    field_ptr[1] = &field_data[1];
-    field_ptr[2] = &field_data[2];
+static BME_RETURN get_data_continue() {
+	if (Get_data_next_intern != NULL) {
+		return Get_data_next_intern();
+	}
 
-    rslt = null_ptr_check(dev);
-    if ((rslt == BME68X_OK) && (data != NULL))
-    {
-        /* Reading the sensor data in forced mode only */
-        if (op_mode == BME68X_FORCED_MODE)
-        {
-            rslt = read_field_data(0, data, dev);
-            if (rslt == BME68X_OK)
-            {
-                if (data->status & BME68X_NEW_DATA_MSK)
-                {
-                    new_fields = 1;
-                }
-                else
-                {
-                    new_fields = 0;
-                    rslt = BME68X_W_NO_NEW_DATA;
-                }
-            }
-        }
-        else if ((op_mode == BME68X_PARALLEL_MODE) || (op_mode == BME68X_SEQUENTIAL_MODE))
-        {
-            /* Read the 3 fields and count the number of new data fields */
-            rslt = read_all_field_data(field_ptr, dev);
+	*Get_data_next = NULL;
 
-            new_fields = 0;
-            for (i = 0; (i < 3) && (rslt == BME68X_OK); i++)
-            {
-                if (field_ptr[i]->status & BME68X_NEW_DATA_MSK)
-                {
-                    new_fields++;
-                }
-            }
+	if (Get_data_data->status & BME68X_NEW_DATA_MSK) {
+		*Get_data_n_data = 1;
+		return LOCAL_NO_RESULT;
+	} else {
+		*Get_data_n_data = 0;
+		return bme68x_return(BME68X_W_NO_NEW_DATA, "get data got no new data");
+	}
+}
+#endif
 
-            /* Sort the sensor data in parallel & sequential modes*/
-            for (i = 0; (i < 2) && (rslt == BME68X_OK); i++)
-            {
-                for (j = i + 1; j < 3; j++)
-                {
-                    sort_sensor_data(i, j, field_ptr);
-                }
-            }
+BME_RETURN bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n_data, struct bme68x_dev *dev, delay_fct *next) {
+	if (n_data == NULL) {
+		return bme68x_return(BME68X_E_NULL_PTR, "got NULL for data pointer");
+	}
 
-            /* Copy the sorted data */
-            for (i = 0; ((i < 3) && (rslt == BME68X_OK)); i++)
-            {
-                data[i] = *field_ptr[i];
-            }
+	BME68X_ATTEMPT(null_ptr_check(dev), "found NULL in device to get data");
 
-            if (new_fields == 0)
-            {
-                rslt = BME68X_W_NO_NEW_DATA;
-            }
-        }
-        else
-        {
-            rslt = BME68X_W_DEFINE_OP_MODE;
-        }
+#if defined(BME_PARALLEL_MODE) || defined(BME_SEQUENTIAL_MODE)
+	int8_t				rslt;
+	uint8_t				i = 0, j = 0, new_fields = 0;
+	struct bme68x_data *field_ptr[3]  = {0};
+	struct bme68x_data	field_data[3] = {{0}};
 
-        if (n_data == NULL)
-        {
-            rslt = BME68X_E_NULL_PTR;
-        }
-        else
-        {
-            *n_data = new_fields;
-        }
-    }
-    else
-    {
-        rslt = BME68X_E_NULL_PTR;
-    }
+	field_ptr[0] = &field_data[0];
+	field_ptr[1] = &field_data[1];
+	field_ptr[2] = &field_data[2];
 
-    return rslt;
+	/* Read the 3 fields and count the number of new data fields */
+	BME68X_ATTEMPT(read_all_field_data(field_ptr, dev), "failed to read data");
+
+	new_fields = 0;
+	for (i = 0; i < 3; i++) {
+		if (field_ptr[i]->status & BME68X_NEW_DATA_MSK) {
+			new_fields++;
+		}
+	}
+
+	/* Sort the sensor data in parallel & sequential modes*/
+	for (i = 0; i < 2; i++) {
+		for (j = i + 1; j < 3; j++) {
+			sort_sensor_data(i, j, field_ptr);
+		}
+	}
+
+	/* Copy the sorted data */
+	for (i = 0; i < 3; i++) {
+		data[i] = *field_ptr[i];
+	}
+
+	if (new_fields == 0) {
+		return (BME_RETURN) {
+			.origin		 = BME6X_LIBRARY,
+			.message	 = "get data got no new data",
+			.bme68x_code = BME68X_W_NO_NEW_DATA};
+	}
+
+	*n_data = new_fields;
+
+	return LOCAL_NO_RESULT;
+#else
+	/* Reading the sensor data in forced mode only */
+	Dev				= dev;
+	Get_data_data	= data;
+	Get_data_n_data = n_data;
+	Get_data_next	= next;
+	*next			= get_data_continue;
+
+	return read_field_data(0, data, dev, &Get_data_next_intern);
+#endif
 }
 
 /*
  * @brief This API is used to set the gas configuration of the sensor.
  */
-int8_t bme68x_set_heatr_conf(uint8_t op_mode, const struct bme68x_heatr_conf *conf, struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t nb_conv = 0;
-    uint8_t hctrl, run_gas = 0;
-    uint8_t ctrl_gas_data[2];
-    uint8_t ctrl_gas_addr[2] = { BME68X_REG_CTRL_GAS_0, BME68X_REG_CTRL_GAS_1 };
+static delay_fct					   Set_heatr_intern, *Set_heatr_next;
+static const struct bme68x_heatr_conf *Set_heatr_conf;
+static uint8_t						   Set_heatr_op_mode;
 
-    if (conf != NULL)
-    {
-        rslt = bme68x_set_op_mode(BME68X_SLEEP_MODE, dev);
-        if (rslt == BME68X_OK)
-        {
-            rslt = set_conf(conf, op_mode, &nb_conv, dev);
-        }
+static BME_RETURN set_heatr_continue() {
+	if (Set_heatr_intern != NULL) {
+		return Set_heatr_intern();
+	}
 
-        if (rslt == BME68X_OK)
-        {
-            rslt = bme68x_get_regs(BME68X_REG_CTRL_GAS_0, ctrl_gas_data, 2, dev);
-            if (rslt == BME68X_OK)
-            {
-                if (conf->enable == BME68X_ENABLE)
-                {
-                    hctrl = BME68X_ENABLE_HEATER;
-                    if (dev->variant_id == BME68X_VARIANT_GAS_HIGH)
-                    {
-                        run_gas = BME68X_ENABLE_GAS_MEAS_H;
-                    }
-                    else
-                    {
-                        run_gas = BME68X_ENABLE_GAS_MEAS_L;
-                    }
-                }
-                else
-                {
-                    hctrl = BME68X_DISABLE_HEATER;
-                    run_gas = BME68X_DISABLE_GAS_MEAS;
-                }
+	uint8_t				 nb_conv = 0;
+	uint8_t				 hctrl, run_gas = 0;
+	uint8_t				 ctrl_gas_data[2];
+	static const uint8_t ctrl_gas_addr[2] = {BME68X_REG_CTRL_GAS_0, BME68X_REG_CTRL_GAS_1};
 
-                ctrl_gas_data[0] = BME68X_SET_BITS(ctrl_gas_data[0], BME68X_HCTRL, hctrl);
-                ctrl_gas_data[1] = BME68X_SET_BITS_POS_0(ctrl_gas_data[1], BME68X_NBCONV, nb_conv);
-                ctrl_gas_data[1] = BME68X_SET_BITS(ctrl_gas_data[1], BME68X_RUN_GAS, run_gas);
-                rslt = bme68x_set_regs(ctrl_gas_addr, ctrl_gas_data, 2, dev);
-            }
-        }
-    }
-    else
-    {
-        rslt = BME68X_E_NULL_PTR;
-    }
+	BME68X_ATTEMPT(set_conf(Set_heatr_conf, Set_heatr_op_mode, &nb_conv, Dev), "failed to set conf for heatr_conf");
+	BME68X_ATTEMPT(bme68x_get_regs(BME68X_REG_CTRL_GAS_0, ctrl_gas_data, 2, Dev), "failed to get CTRL_GAS for heatr_conf");
 
-    return rslt;
+	if (Set_heatr_conf->enable == BME68X_ENABLE) {
+		hctrl = BME68X_ENABLE_HEATER;
+		if (Dev->variant_id == BME68X_VARIANT_GAS_HIGH) {
+			run_gas = BME68X_ENABLE_GAS_MEAS_H;
+		} else {
+			run_gas = BME68X_ENABLE_GAS_MEAS_L;
+		}
+	} else {
+		hctrl	= BME68X_DISABLE_HEATER;
+		run_gas = BME68X_DISABLE_GAS_MEAS;
+	}
+
+	ctrl_gas_data[0] = BME68X_SET_BITS(ctrl_gas_data[0], BME68X_HCTRL, hctrl);
+	ctrl_gas_data[1] = BME68X_SET_BITS_POS_0(ctrl_gas_data[1], BME68X_NBCONV, nb_conv);
+	ctrl_gas_data[1] = BME68X_SET_BITS(ctrl_gas_data[1], BME68X_RUN_GAS, run_gas);
+	BME68X_ATTEMPT(bme68x_set_regs(ctrl_gas_addr, ctrl_gas_data, 2, Dev), "failed to set CTRL_GAS for heater conf");
+
+	return LOCAL_NO_RESULT;
+}
+
+BME_RETURN bme68x_set_heatr_conf(uint8_t op_mode, const struct bme68x_heatr_conf *conf, struct bme68x_dev *dev, delay_fct *next) {
+	Dev				  = dev;
+	Set_heatr_next	  = next;
+	Set_heatr_conf	  = conf;
+	Set_heatr_op_mode = op_mode;
+
+	if (conf != NULL) {
+		return bme68x_set_op_mode(BME68X_SLEEP_MODE, dev, &Set_heatr_intern);
+	}
+
+	return bme68x_return(BME68X_E_NULL_PTR, "got NULL to set heatr conf");
 }
 
 /*
@@ -722,102 +703,102 @@ int8_t bme68x_get_heatr_conf(const struct bme68x_heatr_conf *conf, struct bme68x
 /*
  * @brief This API performs Self-test of low and high gas variants of BME68X
  */
-int8_t bme68x_selftest_check(const struct bme68x_dev *dev)
-{
-    int8_t rslt;
-    uint8_t n_fields;
-    uint8_t i = 0;
-    struct bme68x_data data[BME68X_N_MEAS] = { { 0 } };
-    struct bme68x_dev t_dev;
-    struct bme68x_conf conf;
-    struct bme68x_heatr_conf heatr_conf;
+//int8_t bme68x_selftest_check(const struct bme68x_dev *dev)
+//{
+//	int8_t rslt;
+//	uint8_t n_fields;
+//	uint8_t i = 0;
+//	struct bme68x_data data[BME68X_N_MEAS] = { { 0 } };
+//	struct bme68x_dev t_dev;
+//	struct bme68x_conf conf;
+//	struct bme68x_heatr_conf heatr_conf;
 
-    /* Copy required parameters from reference bme68x_dev struct */
-    t_dev.amb_temp = 25;
-    t_dev.read = dev->read;
-    t_dev.write = dev->write;
-    t_dev.intf = dev->intf;
-    t_dev.delay_us = dev->delay_us;
-    t_dev.intf_ptr = dev->intf_ptr;
-    rslt = bme68x_init(&t_dev);
-    if (rslt == BME68X_OK)
-    {
-        /* Set the temperature, pressure and humidity & filter settings */
-        conf.os_hum = BME68X_OS_1X;
-        conf.os_pres = BME68X_OS_16X;
-        conf.os_temp = BME68X_OS_2X;
+//	/* Copy required parameters from reference bme68x_dev struct */
+//	t_dev.amb_temp = 25;
+//	t_dev.read = dev->read;
+//	t_dev.write = dev->write;
+//	t_dev.intf = dev->intf;
+//	t_dev.delay_us = dev->delay_us;
+//	t_dev.intf_ptr = dev->intf_ptr;
+//	rslt = bme68x_init(&t_dev);
+//	if (rslt == BME68X_OK)
+//	{
+//		/* Set the temperature, pressure and humidity & filter settings */
+//		conf.os_hum = BME68X_OS_1X;
+//		conf.os_pres = BME68X_OS_16X;
+//		conf.os_temp = BME68X_OS_2X;
 
-        /* Set the remaining gas sensor settings and link the heating profile */
-        heatr_conf.enable = BME68X_ENABLE;
-        heatr_conf.heatr_dur = BME68X_HEATR_DUR1;
-        heatr_conf.heatr_temp = BME68X_HIGH_TEMP;
-        rslt = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &t_dev);
-        if (rslt == BME68X_OK)
-        {
-            rslt = bme68x_set_conf(&conf, &t_dev);
-            if (rslt == BME68X_OK)
-            {
-                rslt = bme68x_set_op_mode(BME68X_FORCED_MODE, &t_dev); /* Trigger a measurement */
-                if (rslt == BME68X_OK)
-                {
-                    /* Wait for the measurement to complete */
-                    t_dev.delay_us(BME68X_HEATR_DUR1_DELAY, t_dev.intf_ptr);
-                    rslt = bme68x_get_data(BME68X_FORCED_MODE, &data[0], &n_fields, &t_dev);
-                    if (rslt == BME68X_OK)
-                    {
-                        if ((data[0].idac != 0x00) && (data[0].idac != 0xFF) &&
-                            (data[0].status & BME68X_GASM_VALID_MSK))
-                        {
-                            rslt = BME68X_OK;
-                        }
-                        else
-                        {
-                            rslt = BME68X_E_SELF_TEST;
-                        }
-                    }
-                }
-            }
-        }
+//		/* Set the remaining gas sensor settings and link the heating profile */
+//		heatr_conf.enable = BME68X_ENABLE;
+//		heatr_conf.heatr_dur = BME68X_HEATR_DUR1;
+//		heatr_conf.heatr_temp = BME68X_HIGH_TEMP;
+//		rslt = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &t_dev);
+//		if (rslt == BME68X_OK)
+//		{
+//			rslt = bme68x_set_conf(&conf, &t_dev);
+//			if (rslt == BME68X_OK)
+//			{
+//				rslt = bme68x_set_op_mode(BME68X_FORCED_MODE, &t_dev); /* Trigger a measurement */
+//				if (rslt == BME68X_OK)
+//				{
+//					/* Wait for the measurement to complete */
+//					t_dev.delay_us(BME68X_HEATR_DUR1_DELAY, t_dev.intf_ptr);
+//					rslt = bme68x_get_data(BME68X_FORCED_MODE, &data[0], &n_fields, &t_dev);
+//					if (rslt == BME68X_OK)
+//					{
+//						if ((data[0].idac != 0x00) && (data[0].idac != 0xFF) &&
+//							(data[0].status & BME68X_GASM_VALID_MSK))
+//						{
+//							rslt = BME68X_OK;
+//						}
+//						else
+//						{
+//							rslt = BME68X_E_SELF_TEST;
+//						}
+//					}
+//				}
+//			}
+//		}
 
-        heatr_conf.heatr_dur = BME68X_HEATR_DUR2;
-        while ((rslt == BME68X_OK) && (i < BME68X_N_MEAS))
-        {
-            if (i % 2 == 0)
-            {
-                heatr_conf.heatr_temp = BME68X_HIGH_TEMP; /* Higher temperature */
-            }
-            else
-            {
-                heatr_conf.heatr_temp = BME68X_LOW_TEMP; /* Lower temperature */
-            }
+//		heatr_conf.heatr_dur = BME68X_HEATR_DUR2;
+//		while ((rslt == BME68X_OK) && (i < BME68X_N_MEAS))
+//		{
+//			if (i % 2 == 0)
+//			{
+//				heatr_conf.heatr_temp = BME68X_HIGH_TEMP; /* Higher temperature */
+//			}
+//			else
+//			{
+//				heatr_conf.heatr_temp = BME68X_LOW_TEMP; /* Lower temperature */
+//			}
 
-            rslt = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &t_dev);
-            if (rslt == BME68X_OK)
-            {
-                rslt = bme68x_set_conf(&conf, &t_dev);
-                if (rslt == BME68X_OK)
-                {
-                    rslt = bme68x_set_op_mode(BME68X_FORCED_MODE, &t_dev); /* Trigger a measurement */
-                    if (rslt == BME68X_OK)
-                    {
-                        /* Wait for the measurement to complete */
-                        t_dev.delay_us(BME68X_HEATR_DUR2_DELAY, t_dev.intf_ptr);
-                        rslt = bme68x_get_data(BME68X_FORCED_MODE, &data[i], &n_fields, &t_dev);
-                    }
-                }
-            }
+//			rslt = bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &t_dev);
+//			if (rslt == BME68X_OK)
+//			{
+//				rslt = bme68x_set_conf(&conf, &t_dev);
+//				if (rslt == BME68X_OK)
+//				{
+//					rslt = bme68x_set_op_mode(BME68X_FORCED_MODE, &t_dev); /* Trigger a measurement */
+//					if (rslt == BME68X_OK)
+//					{
+//						/* Wait for the measurement to complete */
+//						t_dev.delay_us(BME68X_HEATR_DUR2_DELAY, t_dev.intf_ptr);
+//						rslt = bme68x_get_data(BME68X_FORCED_MODE, &data[i], &n_fields, &t_dev);
+//					}
+//				}
+//			}
 
-            i++;
-        }
+//			i++;
+//		}
 
-        if (rslt == BME68X_OK)
-        {
-            rslt = analyze_sensor_data(data, BME68X_N_MEAS);
-        }
-    }
+//		if (rslt == BME68X_OK)
+//		{
+//			rslt = analyze_sensor_data(data, BME68X_N_MEAS);
+//		}
+//	}
 
-    return rslt;
-}
+//	return rslt;
+//}
 
 /*****************************INTERNAL APIs***********************************************/
 #ifndef BME68X_USE_FPU
@@ -1188,92 +1169,87 @@ static uint8_t calc_gas_wait(uint16_t dur)
 }
 
 /* This internal API is used to read a single data of the sensor */
-static int8_t read_field_data(uint8_t index, struct bme68x_data *data, struct bme68x_dev *dev)
-{
-    int8_t rslt = BME68X_OK;
-    uint8_t buff[BME68X_LEN_FIELD] = { 0 };
-    uint8_t gas_range_l, gas_range_h;
-    uint32_t adc_temp;
-    uint32_t adc_pres;
-    uint16_t adc_hum;
-    uint16_t adc_gas_res_low, adc_gas_res_high;
-    uint8_t tries = 5;
+static uint8_t			   Read_field_index;
+static struct bme68x_data *Read_field_data;
+static delay_fct *		   Read_field_next;
+static uint8_t			   Read_field_tries;
 
-    while ((tries) && (rslt == BME68X_OK))
-    {
-        rslt = bme68x_get_regs(((uint8_t)(BME68X_REG_FIELD0 + (index * BME68X_LEN_FIELD_OFFSET))),
-                               buff,
-                               (uint16_t)BME68X_LEN_FIELD,
-                               dev);
-        if (!data)
-        {
-            rslt = BME68X_E_NULL_PTR;
-            break;
-        }
+static BME_RETURN read_field_loop() {
+	*Read_field_next = NULL;
 
-        data->status = buff[0] & BME68X_NEW_DATA_MSK;
-        data->gas_index = buff[0] & BME68X_GAS_INDEX_MSK;
-        data->meas_index = buff[1];
+	if (Read_field_tries > 0) {
+		uint8_t buff[BME68X_LEN_FIELD] = {0};
+		BME68X_ATTEMPT(bme68x_get_regs(((uint8_t)(BME68X_REG_FIELD0 + (Read_field_index * BME68X_LEN_FIELD_OFFSET))),
+									   buff,
+									   (uint16_t) BME68X_LEN_FIELD,
+									   Dev),
+					   "failed to get data registers");
 
-        /* read the raw data from the sensor */
-        adc_pres = (uint32_t)(((uint32_t)buff[2] * 4096) | ((uint32_t)buff[3] * 16) | ((uint32_t)buff[4] / 16));
-        adc_temp = (uint32_t)(((uint32_t)buff[5] * 4096) | ((uint32_t)buff[6] * 16) | ((uint32_t)buff[7] / 16));
-        adc_hum = (uint16_t)(((uint32_t)buff[8] * 256) | (uint32_t)buff[9]);
-        adc_gas_res_low = (uint16_t)((uint32_t)buff[13] * 4 | (((uint32_t)buff[14]) / 64));
-        adc_gas_res_high = (uint16_t)((uint32_t)buff[15] * 4 | (((uint32_t)buff[16]) / 64));
-        gas_range_l = buff[14] & BME68X_GAS_RANGE_MSK;
-        gas_range_h = buff[16] & BME68X_GAS_RANGE_MSK;
-        if (dev->variant_id == BME68X_VARIANT_GAS_HIGH)
-        {
-            data->status |= buff[16] & BME68X_GASM_VALID_MSK;
-            data->status |= buff[16] & BME68X_HEAT_STAB_MSK;
-        }
-        else
-        {
-            data->status |= buff[14] & BME68X_GASM_VALID_MSK;
-            data->status |= buff[14] & BME68X_HEAT_STAB_MSK;
-        }
+		Read_field_data->status		= buff[0] & BME68X_NEW_DATA_MSK;
+		Read_field_data->gas_index	= buff[0] & BME68X_GAS_INDEX_MSK;
+		Read_field_data->meas_index = buff[1];
 
-        if ((data->status & BME68X_NEW_DATA_MSK) && (rslt == BME68X_OK))
-        {
-            rslt = bme68x_get_regs(BME68X_REG_RES_HEAT0 + data->gas_index, &data->res_heat, 1, dev);
-            if (rslt == BME68X_OK)
-            {
-                rslt = bme68x_get_regs(BME68X_REG_IDAC_HEAT0 + data->gas_index, &data->idac, 1, dev);
-            }
+		/* read the raw data from the sensor */
+		const uint32_t adc_pres			= (uint32_t)(((uint32_t) buff[2] * 4096) | ((uint32_t) buff[3] * 16) | ((uint32_t) buff[4] / 16));
+		const uint32_t adc_temp			= (uint32_t)(((uint32_t) buff[5] * 4096) | ((uint32_t) buff[6] * 16) | ((uint32_t) buff[7] / 16));
+		const uint16_t adc_hum			= (uint16_t)(((uint32_t) buff[8] * 256) | (uint32_t) buff[9]);
+		const uint16_t adc_gas_res_low	= (uint16_t)((uint32_t) buff[13] * 4 | (((uint32_t) buff[14]) / 64));
+		const uint16_t adc_gas_res_high = (uint16_t)((uint32_t) buff[15] * 4 | (((uint32_t) buff[16]) / 64));
+		const uint8_t  gas_range_l		= buff[14] & BME68X_GAS_RANGE_MSK;
+		const uint8_t  gas_range_h		= buff[16] & BME68X_GAS_RANGE_MSK;
+		if (Dev->variant_id == BME68X_VARIANT_GAS_HIGH) {
+			Read_field_data->status |= buff[16] & BME68X_GASM_VALID_MSK;
+			Read_field_data->status |= buff[16] & BME68X_HEAT_STAB_MSK;
+		} else {
+			Read_field_data->status |= buff[14] & BME68X_GASM_VALID_MSK;
+			Read_field_data->status |= buff[14] & BME68X_HEAT_STAB_MSK;
+		}
 
-            if (rslt == BME68X_OK)
-            {
-                rslt = bme68x_get_regs(BME68X_REG_GAS_WAIT0 + data->gas_index, &data->gas_wait, 1, dev);
-            }
+		if (Read_field_data->status & BME68X_NEW_DATA_MSK) {
+			BME68X_ATTEMPT(bme68x_get_regs(BME68X_REG_RES_HEAT0 + Read_field_data->gas_index, &Read_field_data->res_heat, 1, Dev), "failed to get heater resolution");
+			BME68X_ATTEMPT(bme68x_get_regs(BME68X_REG_IDAC_HEAT0 + Read_field_data->gas_index, &Read_field_data->idac, 1, Dev), "failed to get heater IDAC");
 
-            if (rslt == BME68X_OK)
-            {
-                data->temperature = calc_temperature(adc_temp, dev);
-                data->pressure = calc_pressure(adc_pres, dev);
-                data->humidity = calc_humidity(adc_hum, dev);
-                if (dev->variant_id == BME68X_VARIANT_GAS_HIGH)
-                {
-                    data->gas_resistance = calc_gas_resistance_high(adc_gas_res_high, gas_range_h);
-                }
-                else
-                {
-                    data->gas_resistance = calc_gas_resistance_low(adc_gas_res_low, gas_range_l, dev);
-                }
+			BME68X_ATTEMPT(bme68x_get_regs(BME68X_REG_GAS_WAIT0 + Read_field_data->gas_index, &Read_field_data->gas_wait, 1, Dev), "failed to get gas index");
 
-                break;
-            }
-        }
+			Read_field_data->temperature = calc_temperature(adc_temp, Dev);
+			Read_field_data->pressure	 = calc_pressure(adc_pres, Dev);
+			Read_field_data->humidity	 = calc_humidity(adc_hum, Dev);
+			if (Dev->variant_id == BME68X_VARIANT_GAS_HIGH) {
+				Read_field_data->gas_resistance = calc_gas_resistance_high(adc_gas_res_high, gas_range_h);
+			} else {
+				Read_field_data->gas_resistance = calc_gas_resistance_low(adc_gas_res_low, gas_range_l, Dev);
+			}
 
-        if (rslt == BME68X_OK)
-        {
-            dev->delay_us(BME68X_PERIOD_POLL, dev->intf_ptr);
-        }
+			return LOCAL_NO_RESULT;
+		}
 
-        tries--;
-    }
+		Read_field_tries--;
 
-    return rslt;
+		*Read_field_next = read_field_loop;
+
+		return (BME_RETURN) {
+			.origin		= LOCAL_RETURN,
+			.delay		= BME68X_PERIOD_POLL,
+			.local_code = NO_RESULT};
+	}
+
+	return bme68x_return(BME68X_GET_DATA_MAX_TRIES, "failed to get data after maximum tries");
+}
+
+static BME_RETURN read_field_data(uint8_t index, struct bme68x_data *data, struct bme68x_dev *dev, delay_fct *next) {
+	if (data == NULL) {
+		return bme68x_return(BME68X_E_NULL_PTR, "got empty pointer for data buffer");
+	}
+
+	Dev				 = dev;
+	Read_field_index = index;
+	Read_field_data	 = data;
+	Read_field_next	 = next;
+	Read_field_tries = 5;
+
+	*next = read_field_loop;
+
+	return read_field_loop();
 }
 
 /* This internal API is used to read all data fields of the sensor */
@@ -1354,6 +1330,7 @@ static int8_t read_all_field_data(struct bme68x_data * const data[], struct bme6
     return rslt;
 }
 
+#ifdef BME_SPI_INTERFACE
 /* This internal API is used to switch between SPI memory pages */
 static int8_t set_mem_page(uint8_t reg_addr, struct bme68x_dev *dev)
 {
@@ -1422,6 +1399,7 @@ static int8_t get_mem_page(struct bme68x_dev *dev)
 
     return rslt;
 }
+#endif
 
 /* This internal API is used to limit the max value of a parameter */
 static int8_t boundary_check(uint8_t *value, uint8_t max, struct bme68x_dev *dev)
@@ -1452,7 +1430,7 @@ static int8_t null_ptr_check(const struct bme68x_dev *dev)
 {
     int8_t rslt = BME68X_OK;
 
-    if ((dev == NULL) || (dev->read == NULL) || (dev->write == NULL) || (dev->delay_us == NULL))
+    if ((dev == NULL) || (dev->read == NULL) || (dev->write == NULL))
     {
         /* Device structure pointer is not valid */
         rslt = BME68X_E_NULL_PTR;
