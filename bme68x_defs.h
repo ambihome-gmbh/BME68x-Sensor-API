@@ -52,6 +52,8 @@
 #include <stddef.h>
 #endif
 
+#include "bsec_datatypes.h"
+
 /********************************************************* */
 /*!             Unblocking Definitions                     */
 /********************************************************* */
@@ -87,8 +89,10 @@ typedef struct {
 		LOCAL_RETURN
 	} origin;
 	union {
-		int8_t bme68x_code;
+		int8_t				  bme68x_code;
+		bsec_library_return_t bsec_return;
 		enum LOCAL_CODE {
+			ERROR = -1,
 			OK,
 			NO_RESULT,
 			BME68X_GET_DATA_MAX_TRIES
@@ -96,6 +100,33 @@ typedef struct {
 	};
 	int64_t delay;
 } BME_RETURN;
+
+static BME_RETURN create_BME_RETURN(int origin, int code, int64_t delay, const char *message) {
+	switch (origin) {
+		case BSEC_LIBRARY:
+			return (BME_RETURN) {
+				.origin		 = BSEC_LIBRARY,
+				.bsec_return = code,
+				.message	 = message,
+				.delay		 = delay};
+		case BME6X_LIBRARY:
+			return (BME_RETURN) {
+				.origin		 = BME6X_LIBRARY,
+				.bme68x_code = code,
+				.message	 = message,
+				.delay		 = delay};
+		default:
+			return (BME_RETURN) {
+				.origin		= LOCAL_RETURN,
+				.local_code = code,
+				.message	= message,
+				.delay		= delay};
+	}
+}
+
+static BME_RETURN create_BME_RETURN_nd(int origin, int code, const char *message) {
+	return create_BME_RETURN(origin, code, 0, message);
+}
 
 static const BME_RETURN LOCAL_OK = {
 	.origin		= LOCAL_RETURN,

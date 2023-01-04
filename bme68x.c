@@ -526,7 +526,6 @@ uint32_t bme68x_get_meas_dur(const uint8_t op_mode, struct bme68x_conf *conf, st
  * from the sensor, compensates the data and store it in the bme68x_data
  * structure instance passed by the user.
  */
-#if !defined(BME_PARALLEL_MODE) && !defined(BME_SEQUENTIAL_MODE)
 static delay_fct		   Get_data_next_intern, *Get_data_next;
 static struct bme68x_data *Get_data_data;
 static uint8_t *		   Get_data_n_data;
@@ -546,7 +545,6 @@ static BME_RETURN get_data_continue() {
 		return bme68x_return(BME68X_W_NO_NEW_DATA, "get data got no new data");
 	}
 }
-#endif
 
 BME_RETURN bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n_data, struct bme68x_dev *dev, delay_fct *next) {
 	if (n_data == NULL) {
@@ -555,49 +553,52 @@ BME_RETURN bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n
 
 	BME68X_ATTEMPT(null_ptr_check(dev), "found NULL in device to get data");
 
-#if defined(BME_PARALLEL_MODE) || defined(BME_SEQUENTIAL_MODE)
-	int8_t				rslt;
-	uint8_t				i = 0, j = 0, new_fields = 0;
-	struct bme68x_data *field_ptr[3]  = {0};
-	struct bme68x_data	field_data[3] = {{0}};
+	if (op_mode == BME68X_PARALLEL_MODE || op_mode == BME68X_SEQUENTIAL_MODE) {
+		*next = NULL;
 
-	field_ptr[0] = &field_data[0];
-	field_ptr[1] = &field_data[1];
-	field_ptr[2] = &field_data[2];
+		int8_t				rslt;
+		uint8_t				i = 0, j = 0, new_fields = 0;
+		struct bme68x_data *field_ptr[3]  = {0};
+		struct bme68x_data	field_data[3] = {{0}};
 
-	/* Read the 3 fields and count the number of new data fields */
-	BME68X_ATTEMPT(read_all_field_data(field_ptr, dev), "failed to read data");
+		field_ptr[0] = &field_data[0];
+		field_ptr[1] = &field_data[1];
+		field_ptr[2] = &field_data[2];
 
-	new_fields = 0;
-	for (i = 0; i < 3; i++) {
-		if (field_ptr[i]->status & BME68X_NEW_DATA_MSK) {
-			new_fields++;
+		/* Read the 3 fields and count the number of new data fields */
+		BME68X_ATTEMPT(read_all_field_data(field_ptr, dev), "failed to read data");
+
+		new_fields = 0;
+		for (i = 0; i < 3; i++) {
+			if (field_ptr[i]->status & BME68X_NEW_DATA_MSK) {
+				new_fields++;
+			}
 		}
-	}
 
-	/* Sort the sensor data in parallel & sequential modes*/
-	for (i = 0; i < 2; i++) {
-		for (j = i + 1; j < 3; j++) {
-			sort_sensor_data(i, j, field_ptr);
+		/* Sort the sensor data in parallel & sequential modes*/
+		for (i = 0; i < 2; i++) {
+			for (j = i + 1; j < 3; j++) {
+				sort_sensor_data(i, j, field_ptr);
+			}
 		}
+
+		/* Copy the sorted data */
+		for (i = 0; i < 3; i++) {
+			data[i] = *field_ptr[i];
+		}
+
+		if (new_fields == 0) {
+			return (BME_RETURN) {
+				.origin		 = BME6X_LIBRARY,
+				.message	 = "get data got no new data",
+				.bme68x_code = BME68X_W_NO_NEW_DATA};
+		}
+
+		*n_data = new_fields;
+
+		return LOCAL_NO_RESULT;
 	}
 
-	/* Copy the sorted data */
-	for (i = 0; i < 3; i++) {
-		data[i] = *field_ptr[i];
-	}
-
-	if (new_fields == 0) {
-		return (BME_RETURN) {
-			.origin		 = BME6X_LIBRARY,
-			.message	 = "get data got no new data",
-			.bme68x_code = BME68X_W_NO_NEW_DATA};
-	}
-
-	*n_data = new_fields;
-
-	return LOCAL_NO_RESULT;
-#else
 	/* Reading the sensor data in forced mode only */
 	Dev				= dev;
 	Get_data_data	= data;
@@ -606,7 +607,6 @@ BME_RETURN bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n
 	*next			= get_data_continue;
 
 	return read_field_data(0, data, dev, &Get_data_next_intern);
-#endif
 }
 
 /*
