@@ -621,6 +621,8 @@ static BME_RETURN set_heatr_continue() {
 		return Set_heatr_intern();
 	}
 
+	*Set_heatr_next = NULL;
+
 	uint8_t				 nb_conv = 0;
 	uint8_t				 hctrl, run_gas = 0;
 	uint8_t				 ctrl_gas_data[2];
@@ -654,6 +656,8 @@ BME_RETURN bme68x_set_heatr_conf(uint8_t op_mode, const struct bme68x_heatr_conf
 	Set_heatr_next	  = next;
 	Set_heatr_conf	  = conf;
 	Set_heatr_op_mode = op_mode;
+
+	*next = set_heatr_continue;
 
 	if (conf != NULL) {
 		return bme68x_set_op_mode(BME68X_SLEEP_MODE, dev, &Set_heatr_intern);
