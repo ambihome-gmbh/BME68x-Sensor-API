@@ -52,7 +52,9 @@
 #include <stddef.h>
 #endif
 
+#ifdef USE_BSEC
 #include "bsec_datatypes.h"
+#endif
 
 /********************************************************* */
 /*!             Unblocking Definitions                     */
@@ -80,19 +82,22 @@
 	#endif
 
 typedef struct {
-	#ifdef RASPI_EXE
+#ifdef RASPI_EXE
 	const char *message;
-	#endif
+#endif
 	enum {
+#ifdef USE_BSEC
 		BSEC_LIBRARY,
+#endif
 		BME6X_LIBRARY,
 		LOCAL_RETURN
 	} origin;
 	union {
 		int8_t				  bme68x_code;
+#ifdef USE_BSEC
 		bsec_library_return_t bsec_return;
+#endif
 		enum LOCAL_CODE {
-			ERROR = -1,
 			OK,
 			NO_RESULT,
 			BME68X_GET_DATA_MAX_TRIES
@@ -103,23 +108,31 @@ typedef struct {
 
 static BME_RETURN create_BME_RETURN(int origin, int code, int64_t delay, const char *message) {
 	switch (origin) {
+#ifdef USE_BSEC
 		case BSEC_LIBRARY:
 			return (BME_RETURN) {
 				.origin		 = BSEC_LIBRARY,
 				.bsec_return = code,
+#ifdef RASPI_EXE
 				.message	 = message,
+#endif
 				.delay		 = delay};
+#endif
 		case BME6X_LIBRARY:
 			return (BME_RETURN) {
 				.origin		 = BME6X_LIBRARY,
 				.bme68x_code = code,
+#ifdef RASPI_EXE
 				.message	 = message,
+#endif
 				.delay		 = delay};
 		default:
 			return (BME_RETURN) {
 				.origin		= LOCAL_RETURN,
 				.local_code = code,
+#ifdef RASPI_EXE
 				.message	= message,
+#endif
 				.delay		= delay};
 	}
 }

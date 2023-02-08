@@ -98,11 +98,13 @@ static BME_RETURN read_field_data(uint8_t index, struct bme68x_data *data, struc
 /* This internal API is used to read all data fields of the sensor */
 static int8_t read_all_field_data(struct bme68x_data * const data[], struct bme68x_dev *dev);
 
+#ifdef BME_SPI_INTERFACE
 /* This internal API is used to switch between SPI memory pages */
 static int8_t set_mem_page(uint8_t reg_addr, struct bme68x_dev *dev);
 
 /* This internal API is used to get the current SPI memory page */
 static int8_t get_mem_page(struct bme68x_dev *dev);
+#endif
 
 /* This internal API is used to check the bme68x_dev for null pointers */
 static int8_t null_ptr_check(const struct bme68x_dev *dev);
@@ -133,19 +135,21 @@ static void sort_sensor_data(uint8_t low_index, uint8_t high_index, struct bme68
  * @retval 0 -> Success
  * @retval < 0 -> Fail
  */
+#ifdef ENABLE_SELFTEST
 static int8_t analyze_sensor_data(const struct bme68x_data *data, uint8_t n_meas);
+#endif
 
 /******************************************************************************************/
 /*                                 Global API definitions                                 */
 /******************************************************************************************/
 
-static BME_RETURN bme68x_return(uint8_t code, const char *msg) {
+static BME_RETURN bme68x_return(int8_t code, const char *msg) {
 	return (BME_RETURN) {
 #ifdef RASPI_EXE
 		.message = msg,
 #endif
 		.origin		 = BME6X_LIBRARY,
-		.bme68x_code = (code)};
+		.bme68x_code = code};
 }
 
 /* @brief This API reads the chip-id of the sensor which is the first step to
@@ -277,7 +281,6 @@ static BME_RETURN soft_reset_finish() {
 #endif
 
 BME_RETURN bme68x_soft_reset(struct bme68x_dev *dev, delay_fct *next) {
-	int8_t	rslt;
 	uint8_t reg_addr = BME68X_REG_SOFT_RESET;
 
 	/* 0xb6 is the soft reset command */
@@ -556,7 +559,6 @@ BME_RETURN bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n
 	if (op_mode == BME68X_PARALLEL_MODE || op_mode == BME68X_SEQUENTIAL_MODE) {
 		*next = NULL;
 
-		int8_t				rslt;
 		uint8_t				i = 0, j = 0, new_fields = 0;
 		struct bme68x_data *field_ptr[3]  = {0};
 		struct bme68x_data	field_data[3] = {{0}};
@@ -590,7 +592,9 @@ BME_RETURN bme68x_get_data(uint8_t op_mode, struct bme68x_data *data, uint8_t *n
 		if (new_fields == 0) {
 			return (BME_RETURN) {
 				.origin		 = BME6X_LIBRARY,
+#ifdef RASPI_EXE
 				.message	 = "get data got no new data",
+#endif
 				.bme68x_code = BME68X_W_NO_NEW_DATA};
 		}
 
@@ -1690,6 +1694,7 @@ static void swap_fields(uint8_t index1, uint8_t index2, struct bme68x_data *fiel
     field[index2] = temp;
 }
 
+#ifdef ENABLE_SELFTEST
 /* This Function is to analyze the sensor data */
 static int8_t analyze_sensor_data(const struct bme68x_data *data, uint8_t n_meas)
 {
@@ -1737,6 +1742,7 @@ static int8_t analyze_sensor_data(const struct bme68x_data *data, uint8_t n_meas
 
     return rslt;
 }
+#endif
 
 /* This internal API is used to read the calibration coefficients */
 static int8_t get_calib_data(struct bme68x_dev *dev)
