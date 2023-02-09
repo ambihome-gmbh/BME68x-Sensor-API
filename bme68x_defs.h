@@ -98,6 +98,7 @@ typedef struct {
 		bsec_library_return_t bsec_return;
 #endif
 		enum LOCAL_CODE {
+            LOCAL_ERROR = -1,
 			OK,
 			NO_RESULT,
 			BME68X_GET_DATA_MAX_TRIES
